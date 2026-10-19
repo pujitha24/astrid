@@ -275,3 +275,20 @@ fn prompt_yes_writes_config() {
         Some("127.0.0.1:1234")
     );
 }
+
+#[test]
+fn non_interactive_notice_names_capsule_and_entry_for_local_value() {
+    let n = non_interactive_notice("openai-compat", "http://127.0.0.1:1234/v1").expect("notice");
+    assert!(
+        n.contains("skipping local-egress bless for 'openai-compat'"),
+        "{n}"
+    );
+    assert!(n.contains("[security.capsule_local_egress]"), "{n}");
+    assert!(n.contains("openai-compat = [\"127.0.0.1:1234\"]"), "{n}");
+}
+
+#[test]
+fn non_interactive_notice_is_none_for_non_local_value() {
+    assert!(non_interactive_notice("cap", "https://api.openai.com/v1").is_none());
+    assert!(non_interactive_notice("cap", "not a url").is_none());
+}

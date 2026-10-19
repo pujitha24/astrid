@@ -233,8 +233,9 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// **Non-interactive guard:** when stdin is NOT a terminal (a scripted
 /// `astrid capsule config --set ...`, a piped install, CI), the prompt is
 /// skipped entirely — no stdin is read (so we never block waiting for input or
-/// consume the caller's piped data) and no exemption is written. The operator
-/// can add the `[security.capsule_local_egress]` entry explicitly.
+/// consume the caller's piped data) and no exemption is written. A one-line
+/// warning with the manual `[security.capsule_local_egress]` entry goes to
+/// stderr for a local endpoint so the skip is not silent.
 ///
 /// A no / EOF / non-local / unparseable value is also a silent skip — the
 /// capsule install is never blocked on this. Best-effort: a config write
@@ -248,6 +249,9 @@ pub(crate) fn maybe_prompt_local_egress(capsule_id: &str, value: &str, config_pa
     // input or steal the caller's piped data — and must not auto-write the
     // exemption. Decline before touching stdin or the config.
     if !std::io::stdin().is_terminal() {
+        if let Some(notice) = non_interactive_notice(capsule_id, value) {
+            eprintln!("{notice}");
+        }
         return;
     }
 
@@ -256,6 +260,17 @@ pub(crate) fn maybe_prompt_local_egress(capsule_id: &str, value: &str, config_pa
         std::io::stdin().read_line(&mut input).ok()?;
         Some(input)
     });
+}
+
+/// Warning shown when the prompt is skipped because stdin is not a terminal.
+/// `None` for a non-local / unparseable value (nothing was skipped).
+fn non_interactive_notice(capsule_id: &str, value: &str) -> Option<String> {
+    let entry = local_egress_entry(value)?;
+    Some(format!(
+        "warning: skipping local-egress bless for '{capsule_id}' -> '{value}' (stdin is not a terminal).\n         \
+         Without it the capsule is blocked from {entry}. Add manually to the operator config:\n           \
+         [security.capsule_local_egress]\n           {capsule_id} = [\"{entry}\"]"
+    ))
 }
 
 /// Testable core of [`maybe_prompt_local_egress`], with stdin abstracted behind
