@@ -29,14 +29,30 @@ where
 {
     use tokio::io::AsyncReadExt;
 
+    // `read_exact` is not cancellation-safe, so the short poll timeout may only
+    // wrap a single-byte `read` (which either completes or consumes nothing).
+    // Once the first header byte is in hand, the rest of the header is read
+    // under a payload-style bound so a split prefix is never dropped.
     let mut len_buf = [0u8; 4];
     match tokio::time::timeout(
         std::time::Duration::from_millis(50),
-        stream.read_exact(&mut len_buf),
+        stream.read(&mut len_buf[..1]),
     )
     .await
     {
         Err(_) => return Ok(NetReadStatus::Pending),
+        Ok(Err(e)) if is_peer_disconnect(&e) => return Ok(NetReadStatus::Closed),
+        Ok(Err(e)) => return Err(format!("socket read error: {e}")),
+        Ok(Ok(0)) => return Ok(NetReadStatus::Closed),
+        Ok(Ok(_)) => {},
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(5000),
+        stream.read_exact(&mut len_buf[1..]),
+    )
+    .await
+    {
+        Err(_) => return Err("Frame header read timed out".to_string()),
         Ok(Err(e)) if is_peer_disconnect(&e) => return Ok(NetReadStatus::Closed),
         Ok(Err(e)) => return Err(format!("socket read error: {e}")),
         Ok(Ok(_)) => {},
@@ -197,5 +213,31 @@ mod tests {
         drop(tx);
         let status = read_frame(&mut rx).await.expect("classified, not error");
         assert!(matches!(status, NetReadStatus::Closed));
+    }
+
+    #[tokio::test]
+    async fn read_frame_survives_header_split_across_poll_timeout() {
+        use tokio::io::AsyncWriteExt;
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&[0, 0]).await.unwrap();
+        let writer = tokio::spawn(async move {
+            // Land the rest of the header after the 50 ms poll window.
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            tx.write_all(&[0, 3, b'a', b'b', b'c']).await.unwrap();
+            tx
+        });
+        let status = read_frame(&mut rx).await.expect("frame");
+        assert!(
+            matches!(status, NetReadStatus::Data(ref d) if d == b"abc"),
+            "got {status:?}"
+        );
+        let _tx = writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_frame_pending_when_no_bytes_arrive() {
+        let (_tx, mut rx) = tokio::io::duplex(64);
+        let status = read_frame(&mut rx).await.expect("pending");
+        assert!(matches!(status, NetReadStatus::Pending));
     }
 }
