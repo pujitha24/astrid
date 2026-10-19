@@ -759,11 +759,18 @@ impl CapabilityStore {
 
     /// List all valid tokens across every principal.
     ///
+    /// Expired, revoked and consumed single-use tokens are omitted.
+    ///
     /// # Errors
     ///
     /// Returns an error if storage operations fail.
     pub async fn list_tokens(&self) -> CapabilityResult<Vec<CapabilityToken>> {
         let mut tokens = Vec::new();
+
+        // Snapshot the consumed set — neither guard may be held across the
+        // KV awaits below.
+        let used = self.used_tokens.read().await.clone();
+        let consumed = |token: &CapabilityToken| token.is_single_use() && used.contains(&token.id);
 
         // Session tokens
         {
@@ -773,7 +780,7 @@ impl CapabilityStore {
                 .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
             for principal_map in session.values() {
                 for token in principal_map.values() {
-                    if !token.is_expired() {
+                    if !token.is_expired() && !consumed(token) {
                         tokens.push(token.clone());
                     }
                 }
@@ -802,6 +809,7 @@ impl CapabilityStore {
                     && let Ok(token) = serde_json::from_slice::<CapabilityToken>(&bytes)
                     && !revoked.contains(&token.id)
                     && !token.is_expired()
+                    && !consumed(&token)
                 {
                     tokens.push(token);
                 }

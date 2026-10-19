@@ -678,3 +678,57 @@ async fn test_persistent_v1_token_rejected_after_upgrade() {
         "v1 tokens must be rejected with InvalidSignature; got {result:?}"
     );
 }
+
+#[tokio::test]
+async fn test_list_tokens_excludes_used_single_use() {
+    let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let store = CapabilityStore::with_kv_store(kv).await.unwrap();
+    let keypair = test_keypair();
+
+    let make = |scope: TokenScope, single_use: bool| {
+        CapabilityToken::create_with_options(
+            ResourcePattern::exact("mcp://test:tool").unwrap(),
+            vec![Permission::Invoke],
+            scope,
+            keypair.key_id(),
+            AuditEntryId::new(),
+            &keypair,
+            None,
+            single_use,
+            default_principal(),
+        )
+    };
+
+    let session_used = make(TokenScope::Session, true);
+    let persistent_used = make(TokenScope::Persistent, true);
+    let session_live = make(TokenScope::Session, true);
+    let persistent_multi = make(TokenScope::Persistent, false);
+    let live_ids = [session_live.id.clone(), persistent_multi.id.clone()];
+    let used_ids = [session_used.id.clone(), persistent_used.id.clone()];
+
+    for t in [
+        session_used,
+        persistent_used,
+        session_live,
+        persistent_multi,
+    ] {
+        store.add(t).await.unwrap();
+    }
+    assert_eq!(store.list_tokens().await.unwrap().len(), 4);
+
+    for id in &used_ids {
+        store.mark_used(id).await.unwrap();
+    }
+
+    let listed: Vec<_> = store
+        .list_tokens()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(listed.len(), 2);
+    for id in &live_ids {
+        assert!(listed.contains(id));
+    }
+}
