@@ -12,7 +12,7 @@ use astrid_capsule::capsule::CapsuleId;
 #[cfg(test)]
 use astrid_capsule_install::AuthorityDecision;
 use astrid_capsule_install::github_source::{
-    capsule_assets, extract_github_org_repo, parse_github_source, pick_capsule,
+    extract_github_org_repo, parse_github_source, pick_capsule,
 };
 use astrid_capsule_install::{
     InstallOptions, inspect_archive_for_principal_with_layout,
@@ -29,7 +29,9 @@ pub(crate) use super::install_batch::{
     BatchInstallOutcome, InstalledCapsuleOutcome, RefSpec, begin_verified_local_batch,
     finish_verified_local_batch, install_capsule_batch,
 };
-use super::install_github::{github_api_client, release_tag_url, resolve_github_ref};
+use super::install_github::{
+    fetch_release_capsule_assets, github_api_client, release_tag_url, resolve_github_ref,
+};
 
 mod authority;
 
@@ -331,14 +333,16 @@ async fn install_from_github(
             // `release_tag_url` so a tag containing `/` is percent-encoded as
             // one segment.
             let api_url = release_tag_url(org, repo, &resolved_ref)?;
-            let candidates = if let Ok(response) = client.get(&api_url).send().await
-                && response.status().is_success()
-                && let Ok(json) = response.json::<serde_json::Value>().await
-                && let Some(assets) = json.get("assets").and_then(serde_json::Value::as_array)
-            {
-                capsule_assets(assets)
-            } else {
-                Vec::new()
+            // A failed lookup (rate limit, 5xx, bad body) is not "no asset":
+            // a pin surfaces the real cause; unpinned falls through to build.
+            let candidates = match fetch_release_capsule_assets(&client, &api_url).await {
+                Ok(candidates) => candidates,
+                Err(e) if pinned => {
+                    return Err(e).context(format!(
+                        "failed to list release {resolved_ref} assets for {org}/{repo}"
+                    ));
+                },
+                Err(_) => Vec::new(),
             };
 
             if !candidates.is_empty() {
@@ -429,24 +433,7 @@ pub(crate) async fn resolve_capsule_to_file(
     // first. A missing `.capsule` asset is a hard error — seal requires
     // pre-built release artifacts.
     let api_url = release_tag_url(&org, &repo, &resolved_ref)?;
-    let response = client
-        .get(&api_url)
-        .send()
-        .await
-        .context("failed to fetch release metadata")?;
-    if !response.status().is_success() {
-        bail!(
-            "GitHub API returned {} fetching release {resolved_ref} of {org}/{repo}",
-            response.status()
-        );
-    }
-    let json: serde_json::Value = response.json().await.context("invalid release metadata")?;
-    let assets = json
-        .get("assets")
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let candidates = capsule_assets(assets);
+    let candidates = fetch_release_capsule_assets(&client, &api_url).await?;
     let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
     let Some(idx) = pick_capsule(&names, name_hint)? else {
         bail!(

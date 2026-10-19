@@ -106,3 +106,98 @@ pub(super) async fn resolve_github_ref(
         .unwrap_or("latest")
         .to_string())
 }
+
+/// Describe a non-success GitHub API response, naming rate-limit exhaustion
+/// (403/429 with `x-ratelimit-remaining: 0`) distinctly so it is never
+/// mistaken for a missing release or asset.
+pub(super) fn github_status_error(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    what: &str,
+) -> anyhow::Error {
+    let exhausted = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim() == "0");
+    if exhausted && matches!(status.as_u16(), 403 | 429) {
+        let hint = if github_token().is_some() {
+            "retry after the quota resets"
+        } else {
+            "set GH_TOKEN or GITHUB_TOKEN, or retry after the quota resets"
+        };
+        let reset = headers
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| format!(" (resets at unix time {})", v.trim()))
+            .unwrap_or_default();
+        return anyhow::anyhow!("GitHub API rate limit exceeded while {what}{reset}; {hint}");
+    }
+    anyhow::anyhow!("GitHub API returned {status} while {what}")
+}
+
+/// Fetch a release's `.capsule` assets. A non-success response or malformed
+/// body is an error, not an empty list, so callers can tell "the API call
+/// failed" (e.g. rate limiting) apart from "the release ships no asset".
+pub(super) async fn fetch_release_capsule_assets(
+    client: &reqwest::Client,
+    api_url: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let response = client
+        .get(api_url)
+        .send()
+        .await
+        .context("failed to fetch release metadata")?;
+    if !response.status().is_success() {
+        return Err(github_status_error(
+            response.status(),
+            response.headers(),
+            "fetching release metadata",
+        ));
+    }
+    let json: serde_json::Value = response.json().await.context("invalid release metadata")?;
+    let assets = json
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    Ok(astrid_capsule_install::github_source::capsule_assets(
+        assets,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    fn headers(remaining: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-ratelimit-remaining",
+            HeaderValue::from_str(remaining).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn exhausted_quota_is_named_as_rate_limit() {
+        let msg = github_status_error(StatusCode::FORBIDDEN, &headers("0"), "fetching").to_string();
+        assert!(msg.contains("rate limit exceeded"), "{msg}");
+    }
+
+    #[test]
+    fn forbidden_with_quota_left_is_plain_status() {
+        let msg =
+            github_status_error(StatusCode::FORBIDDEN, &headers("12"), "fetching").to_string();
+        assert!(!msg.contains("rate limit"), "{msg}");
+        assert!(msg.contains("403"), "{msg}");
+    }
+
+    #[test]
+    fn not_found_is_plain_status() {
+        let msg =
+            github_status_error(StatusCode::NOT_FOUND, &HeaderMap::new(), "fetching").to_string();
+        assert!(msg.contains("404"), "{msg}");
+    }
+}
