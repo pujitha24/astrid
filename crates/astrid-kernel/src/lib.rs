@@ -1502,6 +1502,7 @@ impl Kernel {
             drop(spawn_idle_monitor(Arc::clone(&kernel)));
             drop(spawn_react_watchdog(Arc::clone(&kernel)));
             drop(spawn_capsule_health_monitor(Arc::clone(&kernel)));
+            drop(spawn_capability_cleanup(Arc::clone(&kernel)));
         }
         // Passive storm diagnostics — subscribes synchronously inside the
         // call (before the debug-assert below) so it counts toward
@@ -5024,6 +5025,50 @@ async fn publish_watchdog_ticks(
     }
 }
 
+/// How often expired persistent capability tokens are swept from storage.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+const CAPABILITY_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// Spawns a background task that removes expired persistent capability tokens.
+///
+/// Sweeps once at boot and then every [`CAPABILITY_CLEANUP_INTERVAL`] so
+/// expired rows (and their token-id index entries) do not accumulate in the
+/// persistent store for the lifetime of a long-running daemon. Expired tokens
+/// are already rejected at lookup time, so this only reclaims storage. The
+/// task exits when the kernel begins shutdown.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn spawn_capability_cleanup(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
+    spawn_capability_cleanup_every(kernel, CAPABILITY_CLEANUP_INTERVAL)
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn spawn_capability_cleanup_every(
+    kernel: Arc<Kernel>,
+    period: std::time::Duration,
+) -> astrid_runtime::JoinHandle<()> {
+    astrid_runtime::spawn(async move {
+        let mut shutdown = kernel.shutdown_tx.subscribe();
+        let mut interval = astrid_runtime::time::interval(period);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {},
+                _ = shutdown.changed() => return,
+            }
+            metrics::counter!(METRIC_BACKGROUND_TICKS_TOTAL, "loop" => "capability_cleanup")
+                .increment(1);
+            match kernel.capabilities.cleanup_expired().await {
+                Ok(0) => {},
+                Ok(removed) => {
+                    tracing::info!(removed, "Removed expired capability tokens");
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "Expired capability token cleanup failed");
+                },
+            }
+        }
+    })
+}
+
 /// Spawns a periodic watchdog that publishes `astrid.v1.watchdog.tick` events every 5 seconds.
 ///
 /// The `ReAct` capsule (WASM guest) cannot use async timers, so this kernel-side task
@@ -5668,6 +5713,65 @@ async fn apply_single_identity_link(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capability_cleanup_removes_expired_persistent_tokens() {
+        use astrid_capabilities::{AuditEntryId, CapabilityToken, ResourcePattern, TokenScope};
+        use astrid_core::Permission;
+        let root = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(root.path());
+        let kernel = crate::test_kernel_with_home(home).await;
+        let keypair = astrid_crypto::KeyPair::generate();
+        let make_token = |ttl| {
+            CapabilityToken::create(
+                ResourcePattern::exact("mcp://cleanup:run").unwrap(),
+                vec![Permission::Invoke],
+                TokenScope::Persistent,
+                keypair.key_id(),
+                AuditEntryId::new(),
+                &keypair,
+                ttl,
+                PrincipalId::default(),
+            )
+        };
+        let expiring = make_token(Some(chrono::Duration::milliseconds(20)));
+        let expiring_id = expiring.id.clone();
+        let live = make_token(None);
+        let live_id = live.id.clone();
+        kernel.capabilities.add(expiring).await.unwrap();
+        kernel.capabilities.add(live).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(
+            kernel
+                .capabilities
+                .get(&expiring_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let task =
+            spawn_capability_cleanup_every(Arc::clone(&kernel), std::time::Duration::from_hours(1));
+        let mut removed = false;
+        for _ in 0..100 {
+            if kernel
+                .capabilities
+                .get(&expiring_id)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                removed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(removed, "expired token should be swept");
+        assert!(kernel.capabilities.get(&live_id).await.unwrap().is_some());
+
+        kernel.shutdown_tx.send_replace(true);
+        task.await.unwrap();
+    }
     use std::sync::atomic::Ordering;
 
     use astrid_capsule::capsule::{Capsule, CapsuleState, ReadyStatus};
