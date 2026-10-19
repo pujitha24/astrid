@@ -1132,7 +1132,12 @@ impl Kernel {
         // MCP servers have a writable directory.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let mcp = {
-            let mcp_config = ServersConfig::load_default().unwrap_or_default();
+            // A malformed or invalid servers.toml (e.g. a rejected server
+            // name) must fail boot loudly rather than silently dropping every
+            // configured MCP server. A missing file still yields the default.
+            let mcp_config = ServersConfig::load_default().map_err(|e| {
+                std::io::Error::other(format!("Failed to load MCP server config: {e}"))
+            })?;
             let mcp_manager = ServerManager::new(mcp_config)
                 .with_workspace_root(workspace_root.clone())
                 // MCP is a system service, not a principal-home projection.
